@@ -1,0 +1,1471 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+namespace OpenRec_2;
+
+// A minimal, byte-exact Photon GpBinaryV18 + ENet serialization client used to
+// pre-create the game room (which the RecRoom client later joins) on the Luxon
+// MasterServer, before the real client issues its JoinGame(CreateIfNotExists=false).
+public static class PhotonGameCreator
+{
+    // ------------------------------------------------------------------
+    // Config (must match the app + game the RecRoom client will target)
+    // ------------------------------------------------------------------
+    public const string MasterServerHost = "127.0.0.1";
+    public const int MasterServerPort = 5055;
+    public const string GameServerHost = "127.0.0.1";
+    public const int GameServerPort = 5056;
+    public static readonly string GameId = "fa58c6e7-a7b4-4714-8eb4-e6511aebbfbd";
+
+    // AppId used by the RecRoom client (Photon Realtime). Set AppVersion to the
+    // exact version string the client authenticates with so the pre-created game
+    // lands in the SAME app instance (App::get is keyed by {id, version}).
+    public static string AppId = "0000000000000000000000000000000A";
+    // MUST match the exact version string the real client sends on the
+    // MasterServer (seen in luxon log: "version 20230414_prod_2.22").
+    // Luxon keys each game in an app instance by {id, version}; creating the
+    // room under a different version string makes it invisible to the client's
+    // JoinGame(CreateIfNotExists=false) -> it silently disconnects (~4s).
+    public static string AppVersion = "20230414_prod_2.22";
+
+    // ENet constants
+    private const byte CmdAcknowledge = 1;
+    private const byte CmdConnect = 2;
+    private const byte CmdVerifyConnect = 3;
+    private const byte CmdSendReliable = 6;
+    private const byte CmdPing = 8;
+    private const byte FlagReliable = 1;
+    private const byte ControlChannel = 255;
+
+    // GpBinaryV18 kind bytes
+    private const byte KindInit = 0;
+    private const byte KindInitResponse = 1;
+    private const byte KindOperation = 2;
+    private const byte KindOperationResponse = 3;
+    private const byte KindEvent = 4;
+
+    private const byte TCString = 0x07;
+    private const byte TCByteZero = 0x22;
+    private const byte TCBooleanTrue = 0x1C;
+
+    // OpCodes (Luxon common_codes.hpp)
+    private const byte OpAuthenticate = 230;
+    private const byte OpCreateGame = 227;
+    private const byte OpJoinGame = 226;
+
+    // DictKeyCodes
+    private const byte KeyLobbyStats = 211;
+    private const byte KeyLobbyType = 212;
+    private const byte KeyLobbyName = 213;
+    private const byte KeyCreateIfNotExists = 215;
+    private const byte KeyClientAuthType = 217;
+    private const byte KeyAppVersion = 220;
+    private const byte KeyToken = 221;
+    private const byte KeyAppId = 224;
+    private const byte KeyUserId = 225;
+    private const byte KeyGameId = 255;
+
+    // ErrorCodes
+    private const short ReturnOk = 0;
+    private const short GameIdAlreadyExists = -3;
+    // Luxon forked ErrorCodes::Matchmaking::GameIdAlreadyExists is 32766
+    // (0x7FFE), not Photon's -3. Both mean the room id is already registered.
+    private const int LuxonGameIdAlreadyExists = 32766;
+
+    public sealed class Result
+    {
+        public bool Success;
+        public string Message = "";
+        public int CreateGameReturnCode = int.MinValue;
+        internal EnetClient LivePeer;   // kept-open connection when Success (room held alive)
+    }
+
+    // Dorm "GameServer leg": the master's CreateGame only registers the room in
+    // the lobby games list (is_created stays false), so a real client gets
+    // 32758 (GameIdNotExists) from validate_join. To raise is_created we must:
+    //   1) create the room on the MasterServer and capture its token;
+    //   2) close the master connection (this stores the persistent peer +
+    //      invitation server-side; detection ~9s, storage expires after 30s);
+    //   3) connect to the GameServer with that token (TokenAuth) and re-CreateGame
+    //      the same id -> handler_gameserver.cpp:397 sets is_created=true.
+    // The returned LivePeer is the GS connection; keeping it alive counts as a
+    // peer in the room (same role the old master-only connection held).
+    public static Result EnsureDormReady(string lobbyName = "")
+    {
+        var res = new Result();
+        try
+        {
+            // ---- leg 1: master create + capture token ----
+            int createRc = int.MinValue;
+            string token = null;
+            using (var cli = new UdpClient())
+            {
+                cli.Connect(MasterServerHost, MasterServerPort);
+                cli.Client.ReceiveTimeout = 600;
+                var peer = new EnetClient(cli);
+                try
+                {
+                    if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = "GS-leg: ENet handshake failed."; return res; }
+                    var init = BuildInit();
+                    if (!peer.WaitPhase(init, out _)) { res.Message = "GS-leg: Init failed."; return res; }
+                    var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                    if (!peer.WaitPhase(auth, out _) || peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+                    { res.Message = $"GS-leg: Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}."; return res; }
+
+                    var c = BuildOperation(OpCreateGame, BuildCreateGameParams(null, lobbyName));
+                    if (!peer.WaitPhase(c, out _)) { res.Message = "GS-leg: CreateGame silent."; return res; }
+                    createRc = peer.LastResponseReturnCode;
+                    token = peer.LastResponseToken;
+                }
+                finally { peer.Close(); }   // <- server stores the persistent peer here
+            }
+            res.CreateGameReturnCode = createRc;
+
+            if (createRc == GameIdAlreadyExists || createRc == LuxonGameIdAlreadyExists)
+            {
+                // Room already registered but we have no matching token -> can't
+                // raise is_created for it in this cycle. Wait for the room to be
+                // reaped (empty_game_ttl=0) and retry on the next loop tick.
+                res.Message = $"GS-leg: room '{GameId}' already exists (rc={createRc}), no token; waiting for expiry + retry.";
+                return res;
+            }
+            if (createRc != ReturnOk || string.IsNullOrEmpty(token))
+            {
+                res.Message = $"GS-leg: create rc={createRc} token='{token}' (need rc=0 + token).";
+                return res;
+            }
+
+            // Let the master detect the closed connection and store the
+            // persistent peer (detection ~9s, stored peer expires after 30s).
+            System.Threading.Thread.Sleep(15000);
+
+            // ---- leg 2: GameServer TokenAuth + CreateGame -> is_created=true ----
+            var gcli = new UdpClient();
+            gcli.Connect(GameServerHost, GameServerPort);
+            gcli.Client.ReceiveTimeout = 600;
+            var gpeer = new EnetClient(gcli);
+            res.LivePeer = gpeer;
+            try
+            {
+                if (!gpeer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = "GS-leg: GS ENet handshake failed."; return res; }
+                var ginit = BuildInit();
+                if (!gpeer.WaitPhase(ginit, out _)) { res.Message = "GS-leg: GS Init failed."; return res; }
+                var gauth = BuildOperation(OpAuthenticate, BuildTokenAuthParams(token));
+                if (!gpeer.WaitPhase(gauth, out _)) { res.Message = "GS-leg: GS TokenAuth silent."; return res; }
+                if (gpeer.LastResponseReturnCode != ReturnOk)
+                { res.Message = $"GS-leg: GS TokenAuth rc={gpeer.LastResponseReturnCode} (expected 0)."; return res; }
+
+                var gc = BuildOperation(OpCreateGame, BuildCreateGameParams(null, lobbyName));
+                if (!gpeer.WaitPhase(gc, out _)) { res.Message = "GS-leg: GS CreateGame silent."; return res; }
+                if (gpeer.LastResponseReturnCode != ReturnOk)
+                { res.Message = $"GS-leg: GS CreateGame rc={gpeer.LastResponseReturnCode} (expected 0)."; return res; }
+
+                res.Success = true;
+                res.Message = $"Dorm '{GameId}' is_created raised (create={createRc}, GS-Auth=0, GS-Create=0). Room held via GS connection.";
+                return res;
+            }
+            finally
+            {
+                if (!res.Success) gpeer.Close();
+            }
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.EnsureDormReady exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    public static Result CreateGame(string lobbyName = "")
+    {
+        var res = new Result();
+        try
+        {
+            var cli = new UdpClient();
+            cli.Connect(MasterServerHost, MasterServerPort);
+            cli.Client.ReceiveTimeout = 600;
+
+            var peer = new EnetClient(cli);
+            res.LivePeer = peer;
+
+            // 1) Connect handshake
+            if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8)))
+            {
+                peer.Close();
+                res.Message = "ENet handshake failed (no VerifyConnect).";
+                return res;
+            }
+
+            // 2) Init
+            var init = BuildInit();
+            if (!peer.WaitPhase(init, out var initRespTime))
+            {
+                peer.Close();
+                res.Message = "Init failed (no InitResponse).";
+                return res;
+            }
+
+            // 3) Authenticate
+            var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+            if (!peer.WaitPhase(auth, out var authTime))
+            {
+                peer.Close();
+                res.Message = "Authenticate failed (no AuthResponse).";
+                return res;
+            }
+            if (peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+            {
+                peer.Close();
+                res.Message = $"Authenticate failed: op={peer.LastResponseOperationCode} rc={(peer.LastResponseReturnCode == -1 ? "(none)" : peer.LastResponseReturnCode.ToString())}";
+                return res;
+            }
+
+            // 4) CreateGame
+            var create = BuildOperation(OpCreateGame, BuildCreateGameParams(null, lobbyName));
+            if (!peer.WaitPhase(create, out var createTime))
+            {
+                peer.Close();
+                res.Message = "CreateGame failed (no response).";
+                return res;
+            }
+
+            res.CreateGameReturnCode = peer.LastResponseReturnCode;
+            if (peer.LastResponseReturnCode == ReturnOk)
+            {
+                res.Success = true;
+                res.Message = $"Game '{GameId}' created in app '{AppId}' (version '{AppVersion}').";
+            }
+            else if (peer.LastResponseReturnCode == GameIdAlreadyExists)
+            {
+                res.Success = true; // already there => also fine for our purposes
+                res.Message = $"Game '{GameId}' already existed (returnCode=-3). Good.";
+            }
+            else
+            {
+                res.Message = $"CreateGame returned rc={peer.LastResponseReturnCode}.";
+            }
+            return res;
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    // A diagnostics-only join: connects as a plain user and issues
+    // OpJoinGame (226) with CreateIfNotExists left absent (= false default).
+    // Used to check whether the Luxon MasterServer answers the same kind of
+    // JoinGame request the real client sends.
+    public static Result ProbeJoin(string lobbyName = "", int waitMs = 8000)
+    {
+        var res = new Result();
+        try
+        {
+            var cli = new UdpClient();
+            cli.Connect(MasterServerHost, MasterServerPort);
+            cli.Client.ReceiveTimeout = 600;
+
+            var peer = new EnetClient(cli);
+
+            if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8)))
+            {
+                peer.Close();
+                res.Message = $"Join probe('{lobbyName}'): ENet handshake failed.";
+                return res;
+            }
+
+            var init = BuildInit();
+            if (!peer.WaitPhase(init, out _))
+            {
+                peer.Close();
+                res.Message = $"Join probe('{lobbyName}'): Init failed.";
+                return res;
+            }
+
+            var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+            if (!peer.WaitPhase(auth, out _))
+            {
+                peer.Close();
+                res.Message = $"Join probe('{lobbyName}'): Authenticate timeout.";
+                return res;
+            }
+            if (peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+            {
+                peer.Close();
+                res.Message = $"Join probe('{lobbyName}'): Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}.";
+                return res;
+            }
+
+            var join = BuildOperation(OpJoinGame, BuildJoinGameParams(lobbyName));
+            bool got = peer.WaitPhase(join, out _);
+            if (!got)
+            {
+                peer.Close();
+                res.Message = $"Join probe('{lobbyName}'): NO RESPONSE within ~{waitMs / 1000}s (silent).";
+                return res;
+            }
+
+            res.CreateGameReturnCode = peer.LastResponseReturnCode;
+            res.Message = $"Join probe('{lobbyName}'): op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}.";
+            peer.Close();
+            return res;
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeJoin exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    internal static Result ProbeCreateExisting(string gameId, string lobbyName = "", int waitMs = 8000)
+    {
+        var res = new Result();
+        res.CreateGameReturnCode = 0;
+        try
+        {
+            var cli = new UdpClient();
+            cli.Connect(MasterServerHost, MasterServerPort);
+            cli.Client.ReceiveTimeout = 600;
+
+            var peer = new EnetClient(cli);
+
+            if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8)))
+            {
+                peer.Close();
+                res.Message = $"CreateProbe('{lobbyName}'): ENet handshake failed.";
+                return res;
+            }
+
+            var init = BuildInit();
+            if (!peer.WaitPhase(init, out _))
+            {
+                peer.Close();
+                res.Message = $"CreateProbe('{lobbyName}'): Init failed.";
+                return res;
+            }
+
+            var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+            if (!peer.WaitPhase(auth, out _))
+            {
+                peer.Close();
+                res.Message = $"CreateProbe('{lobbyName}'): Authenticate timeout.";
+                return res;
+            }
+            if (peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+            {
+                peer.Close();
+                res.Message = $"CreateProbe('{lobbyName}'): Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}.";
+                return res;
+            }
+
+            var create = BuildOperation(OpCreateGame, BuildCreateGameParams(gameId, lobbyName));
+            bool got = peer.WaitPhase(create, out _);
+            if (!got)
+            {
+                peer.Close();
+                res.Message = $"CreateProbe('{lobbyName}'): NO RESPONSE within ~{waitMs / 1000}s (silent).";
+                return res;
+            }
+
+            res.CreateGameReturnCode = peer.LastResponseReturnCode;
+            res.Message = $"CreateProbe('{lobbyName}'): op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}.";
+            peer.Close();
+            return res;
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeCreateExisting exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    // Decisive same-connection experiment: create a NEW room with a fresh
+    // unique id, then IMMEDIATELY JoinGame it on the SAME authenticated
+    // connection, then re-CreateGame it. This proves whether the contains()
+    // vs find() divergence is real on a single freshly-created game (server
+    // bug) or only happens with long-lived/kept-alive rooms.
+    internal static Result ProbeJoinFlagNoCreate(string newGameId, string lobbyName = "")
+    {
+        var res = new Result();
+        try
+        {
+            var cli = new UdpClient();
+            cli.Connect(MasterServerHost, MasterServerPort);
+            cli.Client.ReceiveTimeout = 800;
+            var peer = new EnetClient(cli);
+            try
+            {
+                if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"FlagNoCreate('{lobbyName}'): ENet handshake failed."; return res; }
+                var init = BuildInit();
+                if (!peer.WaitPhase(init, out _)) { res.Message = $"FlagNoCreate('{lobbyName}'): Init failed."; return res; }
+                var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                if (!peer.WaitPhase(auth, out _) || peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+                { res.Message = $"FlagNoCreate('{lobbyName}'): Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}."; return res; }
+
+                // JoinGame for a never-created FULL game id with CreateIfNotExists=1.
+                var j = BuildOperation(OpJoinGame, BuildJoinGameFlagParams(newGameId, lobbyName, createIfNotExists: true));
+                if (!peer.WaitPhase(j, out _)) { res.Message = $"FlagNoCreate('{lobbyName}'): JoinGame silent."; return res; }
+                int joinRc = peer.LastResponseReturnCode;
+
+                res.CreateGameReturnCode = joinRc;
+                res.Message = $"FLAGNO-YET id={newGameId}: JoinFlag(no prior create)={joinRc}.";
+                return res;
+            }
+            finally { peer.Close(); }
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeJoinFlagNoCreate exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    // Realistic test: join THE dorm game id, which already exists (keepalive
+    // precreator), with CreateIfNotExists=1 — exactly what a RecRoom client
+    // does to enter the dorm.
+    internal static Result ProbeJoinDormFlag(string gameId, string lobbyName = "")
+    {
+        var res = new Result();
+        try
+        {
+            var cli = new UdpClient();
+            cli.Connect(MasterServerHost, MasterServerPort);
+            cli.Client.ReceiveTimeout = 800;
+            var peer = new EnetClient(cli);
+            try
+            {
+                if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"JoinDormFlag('{lobbyName}'): ENet handshake failed."; return res; }
+                var init = BuildInit();
+                if (!peer.WaitPhase(init, out _)) { res.Message = $"JoinDormFlag('{lobbyName}'): Init failed."; return res; }
+                var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                if (!peer.WaitPhase(auth, out _) || peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+                { res.Message = $"JoinDormFlag('{lobbyName}'): Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}."; return res; }
+
+                var j = BuildOperation(OpJoinGame, BuildJoinGameFlagParams(gameId, lobbyName, createIfNotExists: true));
+                if (!peer.WaitPhase(j, out _)) { res.Message = $"JoinDormFlag('{lobbyName}'): JoinGame silent."; return res; }
+                int joinRc = peer.LastResponseReturnCode;
+
+                res.CreateGameReturnCode = joinRc;
+                res.Message = $"JOINDORM-FLAG id={gameId}: JoinFlag(existing dorm)={joinRc}.";
+                return res;
+            }
+            finally { peer.Close(); }
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeJoinDormFlag exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    // THE decisive end-to-end test matching the real Luxon flow. The master's
+    // CreateGame only registers the room in the lobby game list; is_created
+    // stays false until a SECOND connection authenticates on the GameServer
+    // (game.cpp validate_join rejects !is_created with GameIdNotExists 32758).
+    // We now replay that second leg:
+    //   1) master CreateGame(freshId) -> capture Token from the response;
+    //   2) close the master connection (stores the persistent peer+invitation);
+    //   3) connect to the GameServer, TokenAuth, re-CreateGame the same id.
+    //      handler_gameserver.cpp:397 then sets is_created=true;
+    //   4) from a fresh master connection, JoinGame the same id WITHOUT flag.
+    // Expected: step 3 rc=0 and step 4 rc=0 (was 32758 in all sweeps before).
+    internal static Result ProbeSecondLegGameServer(string newGameId, string lobbyName = "")
+    {
+        var res = new Result();
+        try
+        {
+            // ---- 1) master: create the room, capture token ----
+            string token = null;
+            using (var cli = new UdpClient())
+            {
+                cli.Connect(MasterServerHost, MasterServerPort);
+                cli.Client.ReceiveTimeout = 600;
+                var peer = new EnetClient(cli);
+                try
+                {
+                    if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"2LEG('{lobbyName}'): ENet handshake failed."; return res; }
+                    var init = BuildInit();
+                    if (!peer.WaitPhase(init, out _)) { res.Message = $"2LEG('{lobbyName}'): Init failed."; return res; }
+                    var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                    if (!peer.WaitPhase(auth, out _) || peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+                    { res.Message = $"2LEG('{lobbyName}'): Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}."; return res; }
+
+                    // CreateGame -> response must carry a Token (LoadBalancing::Token=221).
+                    var c = BuildOperation(OpCreateGame, BuildCreateGameParams(newGameId, lobbyName));
+                    if (!peer.WaitPhase(c, out _)) { res.Message = $"2LEG('{lobbyName}'): CreateGame silent."; return res; }
+                    int createRc = peer.LastResponseReturnCode;
+                    token = peer.LastResponseToken;
+                    string addr = peer.LastResponseAddress;
+                    res.CreateGameReturnCode = createRc;
+                    if (createRc != ReturnOk || string.IsNullOrEmpty(token))
+                    {
+                        res.Message = $"2LEG('{lobbyName}'): Create rc={createRc} token='{token}' addr='{addr}' (need rc=0 + token).";
+                        return res;
+                    }
+                }
+                finally { peer.Close(); }  // stores persistent peer + invitation server-side
+            }
+
+            // Let the server notice the closed master connection. The master
+            // handler stores the persistent peer (with the game invitation) only
+            // when the connection is fully torn down server-side. The server
+            // detects the teardown after ~9s but expunges the stored peer after
+            // 30s, so sleep ~15s: comfortably after detection, before expiry.
+            System.Threading.Thread.Sleep(15000);
+
+            // ---- 3) GameServer leg: TokenAuth + CreateGame => is_created=true ----
+            int gsAuthRc = int.MinValue, gsCreateRc = int.MinValue;
+            using (var gcli = new UdpClient())
+            {
+                gcli.Connect(GameServerHost, GameServerPort);
+                gcli.Client.ReceiveTimeout = 600;
+                var gpeer = new EnetClient(gcli);
+                try
+                {
+                    if (!gpeer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"2LEG('{lobbyName}'): GS handshake failed."; return res; }
+                    var ginit = BuildInit();
+                    if (!gpeer.WaitPhase(ginit, out _)) { res.Message = $"2LEG('{lobbyName}'): GS Init failed."; return res; }
+                    var gauth = BuildOperation(OpAuthenticate, BuildTokenAuthParams(token));
+                    if (!gpeer.WaitPhase(gauth, out _)) { res.Message = $"2LEG('{lobbyName}'): GS TokenAuth silent."; return res; }
+                    gsAuthRc = gpeer.LastResponseReturnCode;
+                    if (gsAuthRc != ReturnOk)
+                    {
+                        res.Message = $"2LEG('{lobbyName}'): GS TokenAuth rc={gsAuthRc} (expected 0).";
+                        return res;
+                    }
+
+                    var gc = BuildOperation(OpCreateGame, BuildCreateGameParams(newGameId, lobbyName));
+                    if (!gpeer.WaitPhase(gc, out _)) { res.Message = $"2LEG('{lobbyName}'): GS CreateGame silent."; return res; }
+                    gsCreateRc = gpeer.LastResponseReturnCode;
+                }
+                finally { gpeer.Close(); }
+            }
+
+            // ---- 4) fresh master connection: JoinGame WITHOUT CreateIfNotExists ----
+            int verifyRc = int.MinValue;
+            using (var cli = new UdpClient())
+            {
+                cli.Connect(MasterServerHost, MasterServerPort);
+                cli.Client.ReceiveTimeout = 600;
+                var vpeer = new EnetClient(cli);
+                try
+                {
+                    if (!vpeer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"2LEG('{lobbyName}'): verify ENet handshake failed."; return res; }
+                    var vinit = BuildInit();
+                    if (!vpeer.WaitPhase(vinit, out _)) { res.Message = $"2LEG('{lobbyName}'): verify Init failed."; return res; }
+                    var vauth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                    if (!vpeer.WaitPhase(vauth, out _) || vpeer.LastResponseOperationCode != OpAuthenticate || vpeer.LastResponseReturnCode != ReturnOk)
+                    { res.Message = $"2LEG('{lobbyName}'): verify Auth failed op={vpeer.LastResponseOperationCode} rc={vpeer.LastResponseReturnCode}."; return res; }
+
+                    var vj = BuildOperation(OpJoinGame, BuildJoinGameParamsOf(newGameId, lobbyName));
+                    if (!vpeer.WaitPhase(vj, out _)) { res.Message = $"2LEG('{lobbyName}'): verify JoinGame silent."; return res; }
+                    verifyRc = vpeer.LastResponseReturnCode;
+                }
+                finally { vpeer.Close(); }
+            }
+
+            // ---- 5) fresh master connection AS A DIFFERENT PLAYER ----
+            int otherRc = int.MinValue;
+            using (var cli = new UdpClient())
+            {
+                cli.Connect(MasterServerHost, MasterServerPort);
+                cli.Client.ReceiveTimeout = 600;
+                var op = new EnetClient(cli);
+                try
+                {
+                    if (!op.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"2LEG('{lobbyName}'): other ENet handshake failed."; return res; }
+                    var oinit = BuildInit();
+                    if (!op.WaitPhase(oinit, out _)) { res.Message = $"2LEG('{lobbyName}'): other Init failed."; return res; }
+                    var oauth = BuildOperation(OpAuthenticate, BuildAuthParamsOther("probe-visitor-" + DateTime.UtcNow.Ticks.ToString("x")));
+                    if (!op.WaitPhase(oauth, out _) || op.LastResponseOperationCode != OpAuthenticate || op.LastResponseReturnCode != ReturnOk)
+                    { res.Message = $"2LEG('{lobbyName}'): other Auth failed op={op.LastResponseOperationCode} rc={op.LastResponseReturnCode}."; return res; }
+
+                    var oj = BuildOperation(OpJoinGame, BuildJoinGameParamsOf(newGameId, lobbyName));
+                    if (!op.WaitPhase(oj, out _)) { res.Message = $"2LEG('{lobbyName}'): other JoinGame silent."; return res; }
+                    otherRc = op.LastResponseReturnCode;
+                }
+                finally { op.Close(); }
+            }
+
+            res.Message = $"2LEG('{lobbyName}') id={newGameId}: Create={res.CreateGameReturnCode} GS-Auth={gsAuthRc} GS-Create={gsCreateRc} VerifyJoin={verifyRc} OtherJoin={otherRc}.";
+            return res;
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeSecondLegGameServer exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    internal static Result ProbeCreateThenJoinSameConn(string newGameId, string lobbyName = "")
+
+    {
+        var res = new Result();
+        try
+        {
+            var cli = new UdpClient();
+            cli.Connect(MasterServerHost, MasterServerPort);
+            cli.Client.ReceiveTimeout = 600;
+            var peer = new EnetClient(cli);
+            try
+            {
+                if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"SameConn('{lobbyName}'): ENet handshake failed."; return res; }
+                var init = BuildInit();
+                if (!peer.WaitPhase(init, out _)) { res.Message = $"SameConn('{lobbyName}'): Init failed."; return res; }
+                var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                if (!peer.WaitPhase(auth, out _) || peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+                { res.Message = $"SameConn('{lobbyName}'): Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}."; return res; }
+
+                // 1) CreateGame with fresh unique id (expect rc=0 = created)
+                var c = BuildOperation(OpCreateGame, BuildCreateGameParams(newGameId, lobbyName));
+                if (!peer.WaitPhase(c, out _)) { res.Message = $"SameConn('{lobbyName}'): CreateGame(new) silent."; return res; }
+                int createNew = peer.LastResponseReturnCode;
+
+                // 2) JoinGame same id (expect rc=0 = found)
+                var j = BuildOperation(OpJoinGame, BuildJoinGameParamsOf(newGameId, lobbyName));
+                if (!peer.WaitPhase(j, out _)) { res.Message = $"SameConn('{lobbyName}'): JoinGame(new) silent."; return res; }
+                int joinNew = peer.LastResponseReturnCode;
+
+                // 3) CreateGame same id again (expect rc=-3 = already exists)
+                var c2 = BuildOperation(OpCreateGame, BuildCreateGameParams(newGameId, lobbyName));
+                if (!peer.WaitPhase(c2, out _)) { res.Message = $"SameConn('{lobbyName}'): ReCreate silent."; return res; }
+                int createAgain = peer.LastResponseReturnCode;
+
+                res.CreateGameReturnCode = joinNew;
+                res.Message = $"SameConn('{lobbyName}') id={newGameId}: CreateNew={createNew} JoinNew={joinNew} CreateAgain={createAgain}.";
+                return res;
+            }
+            finally { peer.Close(); }
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeCreateThenJoinSameConn exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    // Same-connection decisive test but sending JoinGame with
+    // CreateIfNotExists=true (op 226). Real RecRoom clients often send this flag.
+    internal static Result ProbeJoinEmptyIdFlagSweep()
+    {
+        var res = new Result();
+        try
+        {
+            var hits = new System.Collections.Generic.List<string>();
+            using (var cli = new UdpClient())
+            {
+                cli.Connect(MasterServerHost, MasterServerPort);
+                cli.Client.ReceiveTimeout = 1000;
+                var peer = new EnetClient(cli);
+                try
+                {
+                    if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = "EMPID-SWEEP: ENet handshake failed."; return res; }
+                    var init = BuildInit();
+                    if (!peer.WaitPhase(init, out _)) { res.Message = "EMPID-SWEEP: Init failed."; return res; }
+                    var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                    if (!peer.WaitPhase(auth, out _) || peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+                    { res.Message = $".EMPID-SWEEP: Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}."; return res; }
+
+                    foreach (var key in System.Linq.Enumerable.Range(1, 254)) // 1..254
+                    {
+                        var join = BuildOperation(OpJoinGame, BuildJoinGameFlagParams("", "", (byte)key, 1));
+                        if (!peer.WaitPhase(join, out _)) { hits.Add($"k={key}:silent"); continue; }
+                        int rc = peer.LastResponseReturnCode;
+                        hits.Add($"k={key}:{rc}");
+                        if (rc == ReturnOk) { hits.Add($"WIN-{key}"); break; }
+                        System.Threading.Thread.Sleep(10);
+                    }
+                }
+                finally { peer.Close(); }
+            }
+            res.Message = $"EMPTYID-SWEEP: {string.Join(" ", hits)}.";
+            return res;
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeJoinEmptyIdFlagSweep exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+    internal static Result ProbeCreateThenJoinCreateFlag(string newGameId, string lobbyName = "")
+    {
+        var res = new Result();
+        try
+        {
+            var cli = new UdpClient();
+            cli.Connect(MasterServerHost, MasterServerPort);
+            cli.Client.ReceiveTimeout = 600;
+            var peer = new EnetClient(cli);
+            try
+            {
+                if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"FlagConn('{lobbyName}'): ENet handshake failed."; return res; }
+                var init = BuildInit();
+                if (!peer.WaitPhase(init, out _)) { res.Message = $"FlagConn('{lobbyName}'): Init failed."; return res; }
+                var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                if (!peer.WaitPhase(auth, out _) || peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+                { res.Message = $"FlagConn('{lobbyName}'): Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}."; return res; }
+
+                var c = BuildOperation(OpCreateGame, BuildCreateGameParams(newGameId, lobbyName));
+                if (!peer.WaitPhase(c, out _)) { res.Message = $"FlagConn('{lobbyName}'): CreateGame silent."; return res; }
+                int createNew = peer.LastResponseReturnCode;
+
+                var joinFlag = BuildOperation(OpJoinGame, BuildJoinGameFlagParams(newGameId, lobbyName, createIfNotExists: true));
+                if (!peer.WaitPhase(joinFlag, out _)) { res.Message = $"FlagConn('{lobbyName}'): JoinGame(flag) silent."; return res; }
+                int joinFlagRc = peer.LastResponseReturnCode;
+
+                var c2 = BuildOperation(OpCreateGame, BuildCreateGameParams(newGameId, lobbyName));
+                if (!peer.WaitPhase(c2, out _)) { res.Message = $"FlagConn('{lobbyName}'): ReCreate silent."; return res; }
+                int createAgain = peer.LastResponseReturnCode;
+
+                res.CreateGameReturnCode = joinFlagRc;
+                res.Message = $"FLAG-CONN('{lobbyName}') id={newGameId}: CreateNew={createNew} JoinFlagRc={joinFlagRc} CreateAgain={createAgain}.";
+                return res;
+            }
+            finally { peer.Close(); }
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeCreateThenJoinCreateFlag exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    internal static Result ProbeJoinSweepKeys(string newGameId, string lobbyName = "")
+    {
+        var res = new Result();
+        try
+        {
+            var cli = new UdpClient();
+            cli.Connect(MasterServerHost, MasterServerPort);
+            cli.Client.ReceiveTimeout = 600;
+            var peer = new EnetClient(cli);
+            try
+            {
+                if (!peer.ConnectAndWaitConnected(TimeSpan.FromSeconds(8))) { res.Message = $"Sweep('{lobbyName}'): ENet handshake failed."; return res; }
+                var init = BuildInit();
+                if (!peer.WaitPhase(init, out _)) { res.Message = $"Sweep('{lobbyName}'): Init failed."; return res; }
+                var auth = BuildOperation(OpAuthenticate, BuildAuthParams());
+                if (!peer.WaitPhase(auth, out _) || peer.LastResponseOperationCode != OpAuthenticate || peer.LastResponseReturnCode != ReturnOk)
+                { res.Message = $"Sweep('{lobbyName}'): Auth failed op={peer.LastResponseOperationCode} rc={peer.LastResponseReturnCode}."; return res; }
+
+                var c = BuildOperation(OpCreateGame, BuildCreateGameParams(newGameId, lobbyName));
+                if (!peer.WaitPhase(c, out _)) { res.Message = $"Sweep('{lobbyName}'): CreateGame silent."; return res; }
+                int createNew = peer.LastResponseReturnCode;
+
+                var hits = new System.Collections.Generic.List<string>();
+                int[] candidates = { 214, 215, 216, 217, 220, 221, 223, 229, 230, 231, 233, 235, 236, 237, 240, 241, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254 };
+                foreach (var key in candidates)
+                {
+                    var join = BuildOperation(OpJoinGame, BuildJoinGameSweepParams(newGameId, lobbyName, (byte)key));
+                    if (!peer.WaitPhase(join, out _)) { hits.Add($"k={key}:silent"); continue; }
+                    int rc = peer.LastResponseReturnCode;
+                    hits.Add($"k={key}:{rc}");
+                }
+
+                var c2 = BuildOperation(OpCreateGame, BuildCreateGameParams(newGameId, lobbyName));
+                if (!peer.WaitPhase(c2, out _)) { res.Message = $"Sweep('{lobbyName}'): ReCreate silent."; return res; }
+                int createAgain = peer.LastResponseReturnCode;
+
+                res.CreateGameReturnCode = createAgain;
+                res.Message = $"SWEEP('{lobbyName}') id={newGameId}: CreateNew={createNew} [{string.Join(" ", hits)}] CreateAgain={createAgain}.";
+                return res;
+            }
+            finally { peer.Close(); }
+        }
+        catch (Exception ex)
+        {
+            res.Message = $"PhotonGameCreator.ProbeJoinSweepKeys exception: {ex.GetType().Name}: {ex.Message}";
+            return res;
+        }
+    }
+
+    private static List<byte> BuildJoinGameSweepParams(string gameId, string lobbyName, byte extraKey)
+    {
+        var p = new List<byte>();
+        p.Add(4);
+        AddString(p, KeyGameId, gameId);
+        AddString(p, KeyLobbyName, lobbyName);
+        AddByte(p, KeyLobbyType, 0);
+        AddByte(p, extraKey, 1);
+        return p;
+    }
+
+    private static List<byte> BuildJoinGameFlagParams(string gameId, string lobbyName, bool createIfNotExists)
+    {
+        var p = new List<byte>();
+        p.Add(4);
+        AddString(p, KeyGameId, gameId);
+        AddString(p, KeyLobbyName, lobbyName);
+        AddByte(p, KeyLobbyType, 0);
+        AddByte(p, KeyCreateIfNotExists, createIfNotExists ? (byte)1 : (byte)0);
+        return p;
+    }
+
+    private static List<byte> BuildJoinGameFlagParams(string gameId, string lobbyName, byte createIfNotExistsKey, byte value)
+    {
+        var p = new List<byte>();
+        p.Add(4);
+        AddString(p, KeyGameId, gameId);
+        AddString(p, KeyLobbyName, lobbyName);
+        AddByte(p, KeyLobbyType, 0);
+        AddByte(p, createIfNotExistsKey, value);
+        return p;
+    }
+
+    private static List<byte> BuildJoinGameParamsOf(string gameId, string lobbyName)
+    {
+        var p = new List<byte>();
+        p.Add(3);
+        AddString(p, KeyGameId, gameId);
+        AddString(p, KeyLobbyName, lobbyName);
+        AddByte(p, KeyLobbyType, 0);
+        return p;
+    }
+
+    // Build the GpBinaryV18 Init message: magic F3, kind=0, then body.
+    private static byte[] BuildInit()
+    {
+        // body: 01 08 sdk_enc vcombined patch revision pad + 32-byte appid  (7 + 32 = 39 bytes)
+        byte sdk_enc = (byte)(15 << 1);              // client_sdk_id=15
+        byte vcombined = (byte)(((4 & 0x07) << 4) | (1 & 0x0F)); // version 4.1.6.8, no ipv6 -> 0x41
+        var body = new List<byte>
+        {
+            0x01, 0x08, sdk_enc, vcombined, 0x06, 0x08, 0x00
+        };
+        byte[] appid = new byte[32];
+        byte[] appRaw = Encoding.UTF8.GetBytes(AppId);
+        Array.Copy(appRaw, appid, Math.Min(32, appRaw.Length));
+        body.AddRange(appid);
+        return Wrap(KindInit, body);
+    }
+
+    private static byte[] BuildOperation(byte opCode, List<byte> paramBytes)
+    {
+        var body = new List<byte> { opCode };
+        body.AddRange(paramBytes);
+        return Wrap(KindOperation, body);
+    }
+
+    private static List<byte> BuildAuthParams()
+    {
+        var p = new List<byte>();
+        p.Add(6);                             // paramCount
+        AddString(p, 224, AppId);             // ApplicationId
+        AddString(p, 220, AppVersion ?? "");  // AppVersion
+        AddString(p, KeyUserId, "precreator"); // UserId
+        AddByte(p, KeyClientAuthType, 0);     // ClientAuthenticationType = 0 (Anonymous)
+        AddString(p, 216, "");                // ClientAuthenticationParameters
+        AddBool(p, KeyLobbyStats, true);      // LobbyStats requested
+        return p;
+    }
+
+    private static List<byte> BuildAuthParamsOther(string userId)
+    {
+        var p = new List<byte>();
+        p.Add(6);                             // paramCount
+        AddString(p, 224, AppId);             // ApplicationId
+        AddString(p, 220, AppVersion ?? "");  // AppVersion
+        AddString(p, KeyUserId, userId);      // UserId
+        AddByte(p, KeyClientAuthType, 0);     // ClientAuthenticationType = 0 (Anonymous)
+        AddString(p, 216, "");                // ClientAuthenticationParameters
+        AddBool(p, KeyLobbyStats, true);      // LobbyStats requested
+        return p;
+    }
+
+    // TokenAuth: only the Token parameter (LoadBalancing::Token = 221).
+    private static List<byte> BuildTokenAuthParams(string token)
+    {
+        var p = new List<byte>();
+        p.Add(1);                             // paramCount
+        AddString(p, KeyToken, token);        // Token
+        return p;
+    }
+
+    private static List<byte> BuildCreateGameParams(string gameIdOverride = null, string lobbyName = "")
+    {
+        var p = new List<byte>();
+        p.Add(3);                             // paramCount
+        AddString(p, KeyGameId, gameIdOverride ?? GameId); // GameId
+        AddString(p, KeyLobbyName, lobbyName); // LobbyName
+        AddByte(p, KeyLobbyType, 0);          // LobbyType = Default(0)
+        return p;
+    }
+
+    private static List<byte> BuildJoinGameParams(string lobbyName)
+    {
+        var p = new List<byte>();
+        p.Add(3);                             // paramCount
+        AddString(p, KeyGameId, GameId);      // GameId
+        AddString(p, KeyLobbyName, lobbyName); // LobbyName
+        AddByte(p, KeyLobbyType, 0);          // LobbyType = Default(0)
+        return p;
+    }
+
+    private static byte[] Wrap(byte kind, List<byte> body)
+    {
+        var outBytes = new byte[2 + body.Count];
+        outBytes[0] = 0xF3;
+        outBytes[1] = kind;
+        body.CopyTo(outBytes, 2);
+        return outBytes;
+    }
+
+    private static void AddString(List<byte> dst, byte key, string val)
+    {
+        dst.Add(key);
+        dst.Add(TCString);
+        var bytes = Encoding.UTF8.GetBytes(val ?? "");
+        WriteVarUInt32(dst, (uint)bytes.Length);
+        dst.AddRange(bytes);
+    }
+
+    private static void AddBool(List<byte> dst, byte key, bool val)
+    {
+        dst.Add(key);
+        dst.Add(TCBooleanTrue); // true -> 0x1C
+    }
+
+    private static void AddByte(List<byte> dst, byte key, byte val)
+    {
+        dst.Add(key);
+        if (val == 0)
+        {
+            dst.Add(TCByteZero);
+        }
+        else
+        {
+            dst.Add(0x03);
+            dst.Add(val);
+        }
+    }
+
+    private static void WriteVarUInt32(List<byte> dst, uint value)
+    {
+        do
+        {
+            byte b = (byte)(value & 0x7F);
+            value >>= 7;
+            if (value != 0)
+                b |= 0x80;
+            dst.Add(b);
+        } while (value != 0);
+    }
+
+    // ==================================================================
+    //  Minimal ENet client
+    // ==================================================================
+    internal sealed class EnetClient
+    {
+        private readonly UdpClient _sock;
+        private uint _challenge;
+        private int _peerId = -1;               // -1 for connect packet (0xFFFF)
+        private uint _channel0Seq = 0;          // reliable seq for channel 0
+        private readonly List<SentReliable> _sentReliable = new();
+        private readonly List<byte[]> _pendingAcks = new();
+
+        public byte LastResponseOperationCode { get; private set; }
+        public short LastResponseReturnCode { get; private set; } = -1;
+        public string LastResponseToken { get; private set; }
+        public string LastResponseAddress { get; private set; }
+
+        private sealed class SentReliable
+        {
+            public byte Channel;
+            public uint Seq;
+            public byte[] Payload;
+            public uint SentAt;
+            public int SentCount;
+        }
+
+        private static IPEndPoint _dummyEndpoint = new(IPAddress.Any, 0);
+
+        public EnetClient(UdpClient sock)
+        {
+            _sock = sock;
+            var rnd = new Random();
+            _challenge = (uint)(rnd.Next() * 2 ^ rnd.Next());
+            if (_challenge == 0) _challenge = 0x12345678u;
+        }
+
+        public void Close() { try { _sock.Close(); } catch { } }
+
+        // Keep the authenticated connection alive: process incoming datagrams
+        // (ack/the server ping) and resend anything the server hasn't acked,
+        // indefinitely. Returns when the socket is gone.
+        public void KeepAliveLoop(TimeSpan resendInterval)
+        {
+            while (true)
+            {
+                try
+                {
+                    if (!ProcessNextDatagram(200))
+                    {
+                        // No datagram: resend anything older than resendInterval.
+                        int now = Environment.TickCount;
+                        bool resent = false;
+                        for (int i = 0; i < _sentReliable.Count; i++)
+                        {
+                            if (now - _sentReliable[i].SentAt > resendInterval.TotalMilliseconds)
+                            {
+                                _sentReliable[i].SentAt = unchecked((uint)now);
+                                var built = BuildCommand(_sentReliable[i].Channel, _sentReliable[i].Seq, _sentReliable[i].Payload, out _);
+                                _pendingAcks.Add(built);
+                                resent = true;
+                            }
+                        }
+                        if (resent)
+                        {
+                            SendPacketHeader(_pendingAcks);
+                            _pendingAcks.Clear();
+                        }
+                    }
+                }
+                catch
+                {
+                    return; // socket closed or connection dead
+                }
+            }
+        }
+
+        public bool ConnectAndWaitConnected(TimeSpan timeout)
+        {
+            // Send Connect command (ControlChannel, reliable, seq=1)
+            var connect = new SentReliable { Channel = ControlChannel, Seq = 1, Payload = BuildConnectPayload(), SentAt = Tick() };
+            _sentReliable.Add(connect);
+            SendPacket(connect.Channel, connect.Seq, connect.Payload, control: true);
+
+            var deadline = Environment.TickCount + (int)timeout.TotalMilliseconds;
+            while (!_connected)
+            {
+                int now = Environment.TickCount;
+                if (now >= deadline)
+                {
+                    // timeout -> resend unacked
+                    if (!ResendTimedOut(deadline)) return false;
+                    if (now >= deadline) return false;
+                    continue;
+                }
+
+                int remaining = Math.Max(1, deadline - now);
+                if (!ProcessNextDatagram(remaining))
+                {
+                    if (!_connected)
+                    {
+                        if (!ResendTimedOut(deadline)) return false;
+                        if (Environment.TickCount >= deadline) return false;
+                    }
+                }
+            }
+
+            // We become connected locally upon receiving VerifyConnect; flush ack.
+            return _connected;
+        }
+
+        private bool _connected;
+
+        // Sends a reliable payload on channel 0 and waits for the next
+        // response-routing command (InitResponse / OperationResponse).
+        public bool WaitPhase(byte[] payload, out int completedAt)
+        {
+            completedAt = 0;
+            _phaseDone = false;
+            _channel0Seq++;
+            var sent = new SentReliable { Channel = 0, Seq = _channel0Seq, Payload = payload, SentAt = Tick() };
+            _sentReliable.Add(sent);
+            SendPacket(sent.Channel, sent.Seq, sent.Payload, control: false);
+
+            var deadline = Environment.TickCount + 8000;
+            while (!_phaseDone)
+            {
+                int now = Environment.TickCount;
+                if (now >= deadline)
+                {
+                    if (!ResendTimedOut(deadline)) return false;
+                    if (Environment.TickCount >= deadline) return false;
+                    continue;
+                }
+                int remaining = Math.Max(1, deadline - now);
+                if (!ProcessNextDatagram(remaining))
+                {
+                    if (!_phaseDone && !ResendTimedOut(deadline) && Environment.TickCount >= deadline)
+                        return false;
+                }
+            }
+            completedAt = Environment.TickCount;
+            return _phaseDone;
+        }
+
+        private bool _phaseDone;
+
+        private byte[] BuildConnectPayload()
+        {
+            // 32-byte connect payload (magic constants, from send_connect())
+            var payload = new byte[32];
+            payload[2] = (byte)(1200 >> 8);        // mtu high
+            payload[3] = (byte)(1200 & 0xFF);      // mtu low
+            payload[6] = 128;
+            payload[11] = 2;                        // channel_count
+            payload[22] = 19;
+            payload[23] = 136;
+            payload[27] = 2;
+            payload[31] = 2;
+            return payload;
+        }
+
+        private static uint Tick() => unchecked((uint)Environment.TickCount);
+
+        // Read the next datagram from socket, parse ENet packet, dispatch.
+        // Returns false if timeout elapsed with no datagram.
+        private bool ProcessNextDatagram(int timeoutMs)
+        {
+            byte[] data;
+            try
+            {
+                data = _sock.Receive(ref _dummyEndpoint);
+            }
+            catch (SocketException ex)
+            {
+                // A deadline timeout is normal (nothing arrived). A reset /
+                // not-connected / shutdown means the remote Luxon server went
+                // away: treat that as fatal so KeepAliveLoop exits and the
+                // keepalive loop reconnects+recreates the room.
+                if (ex.SocketErrorCode == SocketError.TimedOut || ex.SocketErrorCode == SocketError.WouldBlock)
+                    return false; // timeout
+                throw; // dead socket -> KeepAliveLoop catch returns
+            }
+            if (data == null) return false;
+
+            HandlePacket(data);
+            // Flush any ACKs we queued for reliable commands received from server.
+            FlushAcks();
+            return true;
+        }
+
+        private void HandlePacket(byte[] p)
+        {
+            if (p.Length < 12) return;
+
+            uint sentTime = ReadU32BE(p, 4);
+            int off = 12; // after peer_id(2)+type(1)+count(1)+sentTime(4)+challenge(4)
+
+            // TODO: for robustness we could validate challenge here.
+
+            while (off + 6 <= p.Length)
+            {
+                byte type = p[off];
+                byte channel = p[off + 1];
+                byte flags = p[off + 2];
+                // reserved byte at off+3
+                uint cmdLen = ReadU32BE(p, off + 4);
+                uint reliableSeq = ReadU32BE(p, off + 8);
+
+                if (cmdLen < 12 || off + (int)cmdLen > p.Length)
+                    break;
+
+                // If reliable, we must ACK it (use the packet's sentTime).
+                if ((flags & FlagReliable) != 0)
+                    QueueAck(type, channel, flags, reliableSeq, sentTime);
+
+                int payloadStart = off + 12;
+                int payloadLen = (int)cmdLen - 12;
+
+                switch (type)
+                {
+                    case CmdConnect: // (server -> us for Connect shouldn't happen, ignore)
+                        break;
+                    case CmdVerifyConnect:
+                        if (payloadLen >= 2)
+                        {
+                            int pid = (p[payloadStart] << 8) | p[payloadStart + 1];
+                            if (_peerId == -1 || _peerId == -2)
+                                _peerId = pid;
+                            _connected = true;
+                            _phaseDone = true;
+                        }
+                        break;
+                    case CmdAcknowledge:
+                        if (payloadLen >= 8)
+                        {
+                            uint ackedSeq = ReadU32BE(p, payloadStart);
+                            // channel that was acked is in 'channel' field
+                            for (int i = _sentReliable.Count - 1; i >= 0; i--)
+                            {
+                                var s = _sentReliable[i];
+                                if (s.Seq == ackedSeq && s.Channel == channel)
+                                {
+                                    _sentReliable.RemoveAt(i);
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    case CmdSendReliable:
+                    {
+                        if (payloadLen > 0)
+                        {
+                            var msg = new byte[payloadLen];
+                            Array.Copy(p, payloadStart, msg, 0, payloadLen);
+                            HandleGpMessage(msg);
+                        }
+                        break;
+                    }
+                    case CmdPing:
+                        // nothing to do (already ACKed above)
+                        break;
+                }
+
+                off += (int)cmdLen;
+            }
+        }
+
+        private void HandleGpMessage(byte[] msg)
+        {
+            if (msg.Length < 2 || msg[0] != 0xF3) return;
+            byte kind = (byte)(msg[1] & 0x7F);
+            switch (kind)
+            {
+                case KindInitResponse:
+                    _phaseDone = true;
+                    break;
+                case KindOperationResponse:
+                    ParseOperationResponse(msg);
+                    _phaseDone = true;
+                    break;
+            }
+        }
+
+        private void ParseOperationResponse(byte[] msg)
+        {
+            // layout: F3, kindB(3), operationCode, returnCode(2 LE), debugMessage(typed), params
+            // debugMessage is TC18_Null(0x08) or TC18_String(0x07)+len+bytes.
+            // params: count(u8) then [key(u8), typed value...].
+            int i = 2;
+            if (i >= msg.Length) return;
+            byte opCode = msg[i++];
+            if (i + 2 > msg.Length) return;
+            short rc = (short)(msg[i] | (msg[i + 1] << 8)); // int16 LE
+            i += 2;
+            LastResponseOperationCode = opCode;
+            LastResponseReturnCode = rc;
+            LastResponseToken = null;
+            LastResponseAddress = null;
+
+            if (i >= msg.Length) return;
+            byte debugType = msg[i++];
+            if (debugType == TCString) // TC18_String - skip debug message
+            {
+                if (!TrySkipVarString(msg, ref i)) return;
+            }
+            else if (debugType != 0x08) // TC18_Null
+            {
+                return; // unexpected debug field
+            }
+
+            if (i >= msg.Length) return;
+            int count = msg[i++];
+            for (int n = 0; n < count && i < msg.Length; n++)
+            {
+                byte key = msg[i++];
+                if (i >= msg.Length) return;
+                byte type = msg[i++];
+                if (type == TCString)
+                {
+                    if (!TryReadVarString(msg, ref i, out string str)) return;
+                    if (key == KeyToken) LastResponseToken = str;
+                    else if (key == 230) LastResponseAddress = str;
+                }
+                else
+                {
+                    if (!SkipValue(type, msg, ref i)) return;
+                }
+            }
+        }
+
+        // Reads varuint32-prefixed UTF-8 string. Returns false if truncated.
+        private static bool TryReadVarString(byte[] msg, ref int i, out string strVal)
+        {
+            strVal = null;
+            if (!TryReadVarUInt(msg, ref i, out uint len)) return false;
+            if (len > int.MaxValue || i + (int)len > msg.Length) return false;
+            strVal = Encoding.UTF8.GetString(msg, i, (int)len);
+            i += (int)len;
+            return true;
+        }
+
+        private static bool TrySkipVarString(byte[] msg, ref int i)
+        {
+            if (!TryReadVarUInt(msg, ref i, out uint len)) return false;
+            if (len > int.MaxValue || i + (int)len > msg.Length) return false;
+            i += (int)len;
+            return true;
+        }
+
+        // Reads varuint32. Returns false if truncated.
+        private static bool TryReadVarUInt(byte[] msg, ref int i, out uint value)
+        {
+            value = 0;
+            int shift = 0;
+            for (int b = 0; b < 5 && i < msg.Length; b++)
+            {
+                byte cur = msg[i++];
+                value |= (uint)(cur & 0x7F) << shift;
+                if ((cur & 0x80) == 0) return true;
+                shift += 7;
+            }
+            return false;
+        }
+
+        // Skips a single GpBinaryV18 typed value given its type code.
+        private static bool SkipValue(byte type, byte[] msg, ref int i)
+        {
+            switch (type)
+            {
+                case 0x08: return true;                                   // Null
+                case 0x1C: case 0x1B: return true;                        // BooleanTrue / BooleanFalse
+                case 0x22: case 0x1D: case 0x1E: case 0x1F: case 0x20: case 0x21: return true; // Zero values
+                case 0x03: return SkipBytes(msg, ref i, 1);               // Byte
+                case 0x05: return SkipBytes(msg, ref i, 2);               // Short
+                case 0x02: return SkipBytes(msg, ref i, 4);               // Float
+                case 0x04: return SkipBytes(msg, ref i, 4);               // Int
+                case 0x06: return SkipBytes(msg, ref i, 8);               // Long
+                case 0x09: return TryReadVarUInt(msg, ref i, out _);      // CompressedInt
+                case 0x0A: for (int k = 0; k < 10 && i < msg.Length; k++) { if ((msg[i++] & 0x80) == 0) return true; } return false; // CompressedLong
+                case TCString: return TrySkipVarString(msg, ref i);       // String
+                default: return false;                                    // unknown -> stop parsing (params trailing)
+            }
+        }
+
+        private static bool SkipBytes(byte[] msg, ref int i, int n)
+        {
+            if (i + n > msg.Length) return false;
+            i += n;
+            return true;
+        }
+
+        private void QueueAck(byte cmdType, byte channel, byte flags, uint reliableSeq, uint sentTime)
+        {
+            // Build 20-byte ACK command.
+            var ack = new byte[20];
+            ack[0] = CmdAcknowledge;      // type
+            ack[1] = channel;             // channel of the acked command
+            ack[2] = 0;                   // flags
+            ack[3] = 4;                   // reserved
+            WriteU32BE(ack, 4, 20);       // command_length
+            WriteU32BE(ack, 8, 0);        // reliable_seq = 0
+            WriteU32BE(ack, 12, reliableSeq); // ack_received_reliable_sequence_number
+            WriteU32BE(ack, 16, sentTime);    // ack_received_sent_time
+            _pendingAcks.Add(ack);
+        }
+
+        private void FlushAcks()
+        {
+            if (_pendingAcks.Count == 0) return;
+            var cmds = new List<byte[]>(_pendingAcks);
+            _pendingAcks.Clear();
+            SendPacketHeader(cmds);
+        }
+
+        private void SendPacket(byte channel, uint seq, byte[] payload, bool control)
+        {
+            var cmd = BuildCommand(channel, seq, payload, out _);
+            SendPacketHeader(new List<byte[]> { cmd });
+        }
+
+        private byte[] BuildCommand(byte channel, uint seq, byte[] payload, out uint totalLen)
+        {
+            int payloadLen = payload?.Length ?? 0;
+            totalLen = (uint)(12 + payloadLen);
+            var cmd = new byte[12 + payloadLen];
+            cmd[0] = channel == ControlChannel ? CmdConnect : CmdSendReliable;
+            cmd[1] = channel;
+            cmd[2] = FlagReliable;
+            cmd[3] = 4;                      // reserved=4
+            WriteU32BE(cmd, 4, totalLen);
+            WriteU32BE(cmd, 8, seq);
+            if (payloadLen > 0)
+                Array.Copy(payload, 0, cmd, 12, payloadLen);
+            return cmd;
+        }
+
+        private void SendPacketHeader(List<byte[]> commands)
+        {
+            int len = 12;
+            foreach (var c in commands) len += c.Length;
+            var packet = new byte[len];
+            WriteU16BE(packet, 0, (ushort)((uint)_peerId & 0xFFFF));
+            packet[2] = 0;                                  // type = PlainNoCrc
+            packet[3] = (byte)commands.Count;               // command_count
+            WriteU32BE(packet, 4, Tick());                  // sent_time
+            WriteU32BE(packet, 8, _challenge);              // challenge
+            int o = 12;
+            foreach (var c in commands)
+            {
+                Array.Copy(c, 0, packet, o, c.Length);
+                o += c.Length;
+            }
+            SendAll(packet);
+        }
+
+        private void SendAll(byte[] packet)
+        {
+            try
+            {
+                _sock.Send(packet, packet.Length);
+            }
+            catch { }
+        }
+
+        private bool ResendTimedOut(int deadline)
+        {
+            int now = Environment.TickCount;
+            bool found = false;
+            var toResend = new List<SentReliable>();
+            for (int i = 0; i < _sentReliable.Count; i++)
+            {
+                now = Environment.TickCount;
+                if (now - _sentReliable[i].SentAt > 1000 && _sentReliable[i].SentCount < 10)
+                {
+                    toResend.Add(_sentReliable[i]);
+                    found = true;
+                }
+            }
+            foreach (var s in toResend)
+            {
+                s.SentAt = unchecked((uint)Environment.TickCount);
+                s.SentCount++;
+                var built = BuildCommand(s.Channel, s.Seq, s.Payload, out _);
+                _pendingAcks.Add(built);
+            }
+            if (found)
+            {
+                SendPacketHeader(_pendingAcks);
+                _pendingAcks.Clear();
+            }
+            return found;
+        }
+    }
+
+    // Read little-endian u16
+    private static ushort ReadU16LE(byte[] b, int off) => (ushort)(b[off] | (b[off + 1] << 8));
+
+    private static uint ReadU32BE(byte[] b, int off) =>
+        ((uint)b[off] << 24) | ((uint)b[off + 1] << 16) | ((uint)b[off + 2] << 8) | b[off + 3];
+
+    private static void WriteU32BE(byte[] b, int off, uint v)
+    {
+        b[off] = (byte)(v >> 24);
+        b[off + 1] = (byte)(v >> 16);
+        b[off + 2] = (byte)(v >> 8);
+        b[off + 3] = (byte)v;
+    }
+
+    private static void WriteU16BE(byte[] b, int off, ushort v)
+    {
+        b[off] = (byte)(v >> 8);
+        b[off + 1] = (byte)v;
+    }
+}

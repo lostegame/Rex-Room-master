@@ -1,0 +1,6 @@
+@Rex_Room_20230414_HostAddress = http://localhost:5229
+
+GET {{Rex_Room_20230414_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
