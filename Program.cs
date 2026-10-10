@@ -19,7 +19,7 @@ while (true)
 {
     if (!Console.IsOutputRedirected) Console.Clear();
     
-    Console.ForegroundColor = ConsoleColor.Cyan;
+    Console.ForegroundColor = ConsoleColor.Red;
     Console.WriteLine("--------------------------------------------------");
     Console.WriteLine(FiggleFonts.Standard.Render("Rex Room 20230414"));
     Console.WriteLine("--------------------------------------------------");
